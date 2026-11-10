@@ -7,5 +7,6 @@ then start and end time must be populated correspondingly with the unix timestam
 3. Countries may be specified by the user as a name or as 2-letter codes. Translate from name to code before populating in the toml. 
 4. Continents may be specified by the user as a name or as codes. Only the codes specified in the schema are allowed. Translate from names to code before populating in the toml. 
 5. If we have a mix of dissimilar region specifiers (e.g. some continents, some countries, some metros, some region numbers) in the user's question, then create one stanza per type of region specifier.
+6, If the user requests to add quota it is almost always disk quota and not object quota, unless explicitly specified. 
 
 

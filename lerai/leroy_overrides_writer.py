@@ -326,6 +326,7 @@ def write_toml(
     Orchestrates override generation through LangGraph and optionally posts
     the final markdown response directly into the originating Webex thread.
     """
+    thread_id = "unknown-thread"
     try:
         app = get_compiled_graph()
         
@@ -350,14 +351,34 @@ def write_toml(
             state = build_initial_input(user_question, jira_xml=xml_string)
             graph_result = app.invoke(state, config=config)
 
+        logger.info(
+            f"Override graph completed (Interrupted: {is_interrupted})",
+            extra={"thread_id": redact_value(thread_id)},
+        )
+
         interrupts = graph_result.get("__interrupt__")
         if interrupts:
+            source = "interrupt"
             final_response = _format_all_interrupts(interrupts)
         else:
+            source = "ai_message"
             final_response = _extract_last_ai_markdown(graph_result)
 
+        logger.info(
+            f"Response resolved (source={source}, length={len(final_response)})",
+            extra={"thread_id": redact_value(thread_id)},
+        )
+
         if not final_response:
-            raise ValueError("Override graph returned no AI response")
+            logger.error(
+                f"Empty response from {source}; "
+                f"result_keys={sorted(graph_result.keys())}, "
+                f"message_types={[_value_from_message(m, 'type') for m in graph_result.get('messages', [])]}",
+                extra={"thread_id": redact_value(thread_id)},
+            )
+            raise ValueError(f"Override graph returned no AI response (source={source})")
+
+        logger.info(f"Final response generated", extra={"thread_id": redact_value(thread_id)})
 
         if webex_message is not None:
             sent = _send_threaded_webex_reply(
@@ -371,10 +392,17 @@ def write_toml(
             return None
 
         return final_response
-
     except Exception as exc:
-        logger.error("Override pipeline failed", extra={"error": redact_value(str(exc))})
+        logger.exception(
+            f"Override pipeline failed: {exc} | status={getattr(exc, 'status_code', None)} | body={getattr(exc, 'body', None)}",
+            extra={"thread_id": redact_value(thread_id)},
+        )
         return _render_template("error", error_message=str(exc))
+
+    #except Exception as exc:
+    #    logger.error("Override pipeline failed", extra={"error": redact_value(str(exc))})
+    #    return _render_template("error", error_message=str(exc))
+    #    return _render_template("error", error_message=str(exc))
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate a Leroy override TOML stanza")

@@ -23,6 +23,13 @@ class OverrideAgentState(TypedDict, total=False):
     draft_toml: Annotated[str, _last_nonempty]
     conflict_report: dict[str, Any] | str
 
+    override_token: Annotated[str, _last_nonempty]
+    git_leroy_output_token: Annotated[str, _last_nonempty]
+
+    # Written by code (never by the model) once a diff report was actually
+    # rendered for the user. Gates the production deploy tool.
+    offline_diff_report_shown: bool
+
 
 if __name__ == "__main__":
     from langgraph.graph import END, START, StateGraph

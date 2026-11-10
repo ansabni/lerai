@@ -3,6 +3,10 @@ from __future__ import annotations
 import ast
 import logging
 import os
+import ast
+import json
+import logging
+import os
 from typing import Any, Tuple
 
 import requests
@@ -13,7 +17,6 @@ from lerai.error_truncation import truncate_with_marker
 logger = logging.getLogger(__name__)
 
 DEFAULT_HTTP_TIMEOUT_SECONDS = 900.0
-
 
 def _log_api_request(method: str, url: str, payload: dict[str, Any] | None = None) -> None:
     redacted_url = redact_value(url)
@@ -29,7 +32,6 @@ def _log_api_request(method: str, url: str, payload: dict[str, Any] | None = Non
             "payload": redacted_payload,
         },
     )
-
 
 def _log_api_response(response: requests.Response, payload: Any | None = None) -> None:
     payload_value = redact_value(payload) if payload is not None else None
@@ -156,7 +158,7 @@ def fetch_override_and_token() -> tuple[str, str]:
     _log_api_request("GET", override_token_url)
 
     try:
-        response = requests.get(override_token_url, cert=cert, timeout=300)
+        response = requests.get(override_token_url, cert=cert, timeout=300, verify=False)
         _log_api_response(response, payload=_safe_json_payload(response))
         response.raise_for_status()
 
@@ -219,6 +221,7 @@ def submit_offline_override(updated_toml: str, base_token: str) -> dict[str, Any
             json=request_payload,
             cert=cert,
             timeout=timeout_seconds,
+            verify=False
         )
         _log_api_response(response, payload=_safe_json_payload(response))
         response.raise_for_status()
@@ -261,3 +264,156 @@ def submit_offline_override(updated_toml: str, base_token: str) -> dict[str, Any
             extra={"error": redact_value(str(exc))},
         )
         raise
+
+
+def _normalize_diff_payload(payload: Any) -> list[dict[str, Any]]:
+    """Coerce the diff endpoint response into a list of per-file diff entries."""
+    # Some endpoints wrap the real result in a `stdout` string.
+    if isinstance(payload, dict) and "filename" not in payload:
+        returncode = payload.get("returncode")
+        if returncode not in (None, 0):
+            raise ValueError(_build_upstream_failure_message(payload))
+
+        stdout_value = payload.get("stdout")
+        if isinstance(stdout_value, str) and stdout_value.strip():
+            text = stdout_value.strip()
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                try:
+                    payload = ast.literal_eval(text)
+                except (ValueError, SyntaxError) as exc:
+                    raise ValueError(
+                        "Offline/production diff stdout is not parseable JSON or Python "
+                        "literal: " + truncate_with_marker(text, "stdout")
+                    ) from exc
+        elif "diffs" in payload or "files" in payload:
+            payload = payload.get("diffs") or payload.get("files")
+
+    # The parsed stdout may itself wrap the entries under a "diffs"/"files" key.
+    if isinstance(payload, dict) and "filename" not in payload:
+        nested = payload.get("diffs") or payload.get("files")
+        if isinstance(nested, dict):
+            payload = nested
+
+    if isinstance(payload, dict):
+        # Either a single file entry, or a mapping of filename -> entry.
+        if "filename" in payload:
+            return [payload]
+        entries: list[dict[str, Any]] = []
+        for filename, entry in payload.items():
+            if isinstance(entry, dict):
+                entries.append({"filename": filename, **entry})
+        if entries:
+            return entries
+        raise TypeError("Offline/production diff payload contained no file entries")
+
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+
+    raise TypeError("Offline/production diff payload must be a list or dictionary")
+
+
+def fetch_offline_prod_csv_diff() -> list[dict[str, Any]]:
+    """Fetch per-file offline-vs-production CSV diffs from the diff endpoint.
+
+    Each returned entry contains ``filename``, ``offline_last_modified``,
+    ``production_last_modified``, ``structure_diffs`` and ``quota_diffs``.
+    """
+    diff_url = os.environ.get("OFFLINE_PROD_DIFF_ERRORS_URL")
+    if not diff_url:
+        raise ValueError("OFFLINE_PROD_DIFF_ERRORS_URL environment variable is required")
+
+    cert = _request_certs()
+    _log_api_request("GET", diff_url)
+
+    try:
+        response = requests.get(diff_url, cert=cert, timeout=300, verify=False)
+        _log_api_response(response, payload=_safe_json_payload(response))
+        response.raise_for_status()
+
+        entries = _normalize_diff_payload(response.json())
+        logger.info(
+            "Parsed offline/production CSV diff payload",
+            extra={"file_count": len(entries)},
+        )
+        return entries
+
+    except (requests.RequestException, ValueError, TypeError, SyntaxError) as exc:
+        logger.exception(
+            "Failed to fetch offline/production CSV diff payload",
+            extra={"error": redact_value(str(exc))},
+        )
+        raise
+
+def deploy_override(
+    updated_toml: str,
+    git_leroy_output_token: str,
+    override_token: str | None = None,
+    base_token: str | None = None,
+) -> dict[str, Any]:
+    """Promote a previously computed offline override run to production.
+
+    Call only after the offline computation succeeded and the user approved the
+    offline-vs-production diff.
+    """
+    deploy_url = os.environ.get("RUN_DEPLOY_OFFLINE_OVERRIDE")
+    if not deploy_url:
+        raise ValueError("RUN_DEPLOY_OFFLINE_OVERRIDE environment variable is required")
+
+    if not updated_toml or not updated_toml.strip():
+        raise ValueError("updated_toml is required to deploy an override")
+    if not git_leroy_output_token:
+        raise ValueError("git_leroy_output_token is required to deploy an override")
+
+    cert = _request_certs()
+
+    raw_timeout = os.environ.get("RUN_DEPLOY_OFFLINE_OVERRIDE_TIMEOUT_SEC")
+    timeout_seconds = DEFAULT_HTTP_TIMEOUT_SECONDS
+    if raw_timeout is not None:
+        try:
+            timeout_seconds = int(raw_timeout)
+        except ValueError:
+            logger.warning(
+                "Invalid RUN_DEPLOY_OFFLINE_OVERRIDE_TIMEOUT_SEC=%r; using default %s",
+                raw_timeout,
+                DEFAULT_HTTP_TIMEOUT_SECONDS,
+            )
+
+    request_payload: dict[str, Any] = {
+        "updated_toml": updated_toml,
+        "git_leroy_output_token": git_leroy_output_token,
+    }
+    if override_token:
+        request_payload["offline_override_token"] = override_token
+    if base_token:
+        # Production override revision the edit was based on, so the server can
+        # reject the promote if production changed during review.
+        request_payload["base_override_token"] = base_token
+
+    _log_api_request("POST", deploy_url, payload=request_payload)
+
+    try:
+        response = requests.post(
+            deploy_url,
+            json=request_payload,
+            cert=cert,
+            timeout=timeout_seconds,
+            verify=False,
+        )
+        _log_api_response(response, payload=_safe_json_payload(response))
+        response.raise_for_status()
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise TypeError("deploy override response payload must be a dictionary")
+
+        if _looks_like_offline_result(payload) and not _coerce_success_flag(
+            payload.get("success")
+        ):
+            raise RuntimeError(_build_upstream_failure_message(payload))
+
+        return payload
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.exception("Failed to deploy override via deploy endpoint")
+        raise RuntimeError(f"Deploy override request failed: {exc}") from exc

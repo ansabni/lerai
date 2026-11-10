@@ -28,12 +28,17 @@ from lerai_commands import (
     TriggerCplexCommand,
     DiffAnalystCommand,
     DiffAnalystV2Command,
+    OfflineProdDiffCommand,
+    LRPendingDPCommand,
+    LRLiveMachinesCommand,
 )
 
 # Import scheduled jobs
 from scheduled_jobs import (
     send_daily_csv_diff_report,
     send_daily_offload_report,
+    send_daily_large_dp_report,
+    send_daily_live_machine_report,
 )
 from lerai.logging_utils import configure_default_logging
 
@@ -161,7 +166,7 @@ def lerai_main():
 
     bot = MentionOnlyWebexBot(
         teams_bot_token=BOT_TOKEN,
-        bot_name="doombot",
+        bot_name="ShakaBot",
         include_demo_commands=False,
         approved_domains=['akamai.com']
     )
@@ -181,6 +186,9 @@ def lerai_main():
     bot.add_command(TriggerCplexCommand())
     bot.add_command(DiffAnalystV2Command())
     bot.add_command(DiffAnalystCommand())
+    bot.add_command(OfflineProdDiffCommand())
+    bot.add_command(LRPendingDPCommand())
+    bot.add_command(LRLiveMachinesCommand())
     #bot.add_command(SimulateDailyReport())
     #bot.add_command(SimulateDailyOffloadReport())
 
@@ -192,7 +200,10 @@ def lerai_main():
     #scheduler.add_job(send_daily_csv_diff_report, "cron", hour=15, minute=20)
     #scheduler.add_job(send_daily_query2_variance_report, "cron", hour=6, minute=15)
     #scheduler.add_job(send_daily_quota_exceed_report, "cron", hour=19, minute=2)
-    #scheduler.start()
+    scheduler = BackgroundScheduler(timezone="America/New_York")
+    scheduler.add_job(send_daily_large_dp_report, "cron", hour=11, minute=0)
+    scheduler.add_job(send_daily_live_machine_report, "cron", hour=11, minute=0)
+    scheduler.start()
 
     # What are my logging levels?
     # Iterate through all active loggers

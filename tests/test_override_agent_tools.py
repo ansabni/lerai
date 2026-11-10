@@ -18,7 +18,7 @@ class CompactDeployResultTests(unittest.TestCase):
         self.assertEqual(compact["ok"], True)
         self.assertEqual(compact["success"], True)
         self.assertEqual(compact["returncode"], 0)
-        self.assertEqual(compact["offline_token"], "abc123")
+        self.assertEqual(compact["git_leroy_output_token"], "abc123")
         self.assertNotIn("offline_diff", compact)
 
     def test_handles_invalid_offline_diff_string(self):

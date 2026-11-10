@@ -246,7 +246,7 @@ def handle_approval_request(message, activity):
     api = WebexTeamsAPI(access_token=webex_token)
 
     try:
-        response = requests.get(url, params=params, timeout=60, cert=(cert_path,key_path))        
+        response = requests.get(url, params=params, timeout=60, cert=(cert_path,key_path), verify=False)  # Set verify=True in production if you have a valid SSL certificate
         if response.status_code == 200:
             # 1. Parse the JSON body into a dictionary
             data = response.json() 

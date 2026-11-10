@@ -171,3 +171,81 @@ def send_daily_quota_exceed_report():
     api = WebexTeamsAPI(access_token=webex_token)
     api.messages.create(roomId=offload_space_id, markdown=section)
     
+# ...existing code...
+from query2_variance_addition import check_query2_for_variance_addition
+from quota_exceed import check_query2_for_quota_exceed
+from lerai.logging_utils import redact_value
+from dp_monitor.dp_additions import (
+    check_and_notify_new_large_dps,
+    format_large_dp_notification,
+    check_and_update_live_machine_counts,
+    format_live_machine_update_notification,
+)
+# ...existing code...
+
+def send_daily_large_dp_report():
+    """
+    Scheduled job: runs once a day inside the bot process.
+    - Calls check_and_notify_new_large_dps, which finds DPs in DEPLOY status
+      whose Large Region will exceed 128 machines once the DP completes,
+      and inserts corresponding rows into dp_tracker_lr_gt_128_machines.
+    - If any new rows were tracked, posts a summary to the LR Ops webex space.
+    """
+    logger.info("Daily Large DP tracker job starting")
+    if not webex_token or not space_id:
+        logger.warning("Daily Large DP tracker job skipped because WEBEX_ACCESS_TOKEN or WEBEX_SPACE_ID is not set")
+        return
+
+    section = ""
+    try:
+        newly_tracked = check_and_notify_new_large_dps()
+        message = format_large_dp_notification(newly_tracked)
+        if not message:
+            logger.info("No new large DPs found; nothing to report")
+            return
+        section = message
+    except Exception as e:
+        section = (
+            "❌ **Large Region DP Watch**\n\n"
+            f"Failed to run daily large DP check.\n\n"
+            f"Error: `{e}`\n"
+        )
+        logger.exception("Daily Large DP tracker job error")
+
+    api = WebexTeamsAPI(access_token=webex_token)
+    api.messages.create(roomId=space_id, markdown=section)
+
+
+def send_daily_live_machine_report():
+    """
+    Scheduled job: runs once a day inside the bot process.
+    - Calls check_and_update_live_machine_counts, which checks whether
+      machines for already-tracked (DP, Region, HWType) rows have gone
+      live in the network, and updates dp_tracker_lr_gt_128_machines
+      accordingly.
+    - If any rows were updated (or were updated within the last 3 days),
+      posts a summary to the LR Ops webex space.
+    """
+    logger.info("Daily Large DP live-machine job starting")
+    if not webex_token or not space_id:
+        logger.warning("Daily live-machine job skipped because WEBEX_ACCESS_TOKEN or WEBEX_SPACE_ID is not set")
+        return
+
+    section = ""
+    try:
+        updated = check_and_update_live_machine_counts()
+        message = format_live_machine_update_notification(updated)
+        if not message:
+            logger.info("No live-machine updates found; nothing to report")
+            return
+        section = message
+    except Exception as e:
+        section = (
+            "❌ **Large Region DP Live-Machine Watch**\n\n"
+            f"Failed to run daily live-machine check.\n\n"
+            f"Error: `{e}`\n"
+        )
+        logger.exception("Daily live-machine job error")
+
+    api = WebexTeamsAPI(access_token=webex_token)
+    api.messages.create(roomId=space_id, markdown=section)

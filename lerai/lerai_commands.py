@@ -16,9 +16,89 @@ from cplex_runner import run_cplex_agent
 from diff_runner import run_diff_agent, run_diff_agent_v2
 from lerai.logging_utils import log_user_request, redact_value
 
+from dp_monitor.dp_additions import (
+    check_and_notify_new_large_dps,
+    format_large_dp_notification,
+    check_and_update_live_machine_counts,
+    format_live_machine_update_notification,
+)
 
 logger = logging.getLogger(__name__)
 
+
+class LRPendingDPCommand(Command):
+    """
+    Usage in Webex:
+      /lrq
+    """
+
+    def __init__(self):
+        super().__init__(
+            command_keyword="/lrq",
+            exact_command_keyword_match=True,
+            help_message="Check for new Large Region DPs exceeding 128 machines",
+            card=None,
+        )
+
+    def pre_execute(self, message, attachment_actions, activity):
+        log_user_request(logger, self.command_keyword, message, activity)
+        return "🔍 Checking pending Large Region DPs... please wait."
+
+    def execute(self, message, attachment_actions, activity):
+        try:
+            newly_tracked = check_and_notify_new_large_dps()
+            result = format_large_dp_notification(newly_tracked)
+            return result or "✅ No Large Region DPs currently exceed the 128-machine threshold."
+        except Exception as e:
+            return f"Error while checking pending Large Region DPs: {e}"
+
+class LRLiveMachinesCommand(Command):
+    """
+    Usage in Webex:
+      /lrlive
+    """
+
+    def __init__(self):
+        super().__init__(
+            command_keyword="/lrlive",
+            exact_command_keyword_match=True,
+            help_message="Check for tracked Large Region DPs whose machines have gone live",
+            card=None,
+        )
+
+    def pre_execute(self, message, attachment_actions, activity):
+        log_user_request(logger, self.command_keyword, message, activity)
+        return "🔍 Checking live machine counts for tracked DPs... please wait."
+
+    def execute(self, message, attachment_actions, activity):
+        try:
+            updated = check_and_update_live_machine_counts()
+            result = format_live_machine_update_notification(updated)
+            return result or "✅ No new live machines detected for tracked DPs."
+        except Exception as e:
+            return f"Error while checking live machine counts: {e}"
+
+
+class OfflineProdDiffCommand(Command):
+    def __init__(self):
+        super().__init__(
+            command_keyword="/offline_prod_diff",
+            exact_command_keyword_match=True,
+            help_message="Show offline vs production CSV diff",
+            card=None,
+        )
+
+    def pre_execute(self, message, attachment_actions, activity):
+        return "✅ Fetching offline vs production diff... please wait."
+
+    def execute(self, message, attachment_actions, activity):
+        from lerai.api_clients.override_api import fetch_offline_prod_csv_diff
+        from lerai.override_agent.tools import _render_offline_prod_diff_report
+        try:
+            return _render_offline_prod_diff_report(fetch_offline_prod_csv_diff())
+        except Exception as exc:
+            return f"⚠️ **Offline/prod diff failed**\n\n```text\n{exc}\n```"
+            
 
 class CompareCsvEnvsCommand(Command):
     def __init__(self):

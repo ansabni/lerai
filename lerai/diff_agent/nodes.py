@@ -55,6 +55,7 @@ def ingest_and_filter_node(state: DiffAgentState) -> dict:
 				params={"token": composite_token},
 				timeout=60,
 				cert=cert_arg,
+				verify=False  # Set to True in production if you have a valid SSL certificate
 			)
 			# logger.info("Raw API response:\n%s", resp)
 			resp.raise_for_status()

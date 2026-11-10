@@ -15,7 +15,6 @@ from langgraph.types import Command, interrupt
 
 from langgraph.prebuilt import InjectedState, ToolRuntime
 
-from lerai.api_clients.override_api import fetch_override_and_token, submit_offline_override
 from lerai.error_truncation import truncate_with_marker
 from lerai.override_agent.knowledge_base import search_leroy_knowledge_base
 from lerai.overrides_pipeline.conflict_detector import detect_conflicts, find_invalid_mapnames
@@ -25,6 +24,13 @@ from lerai.overrides_pipeline.toml_generator import (
     validate_stanza,
 )
 from lerai.overrides_pipeline.entity_extractor import extract_intent
+
+from lerai.api_clients.override_api import (
+    deploy_override,
+    fetch_offline_prod_csv_diff,
+    fetch_override_and_token,
+    submit_offline_override,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _PROJECT_ROOT = PROJECT_ROOT
@@ -413,9 +419,8 @@ def apply_override_to_workspace(
     new_intents_json: str,
     target_intents_json: str,
     live_override_toml: Annotated[str, InjectedState("live_override_toml")],
-    config: RunnableConfig,
     runtime: ToolRuntime,
-    draft_toml: Annotated[str | None, InjectedState("draft_toml")] = None,
+    draft_toml: Annotated[str | None, InjectedState("draft_toml")],
 ) -> Command:
     """
     STEP 6 TOOL. Use this tool ONLY after the user explicitly approves the deployment of the override.
@@ -426,7 +431,6 @@ def apply_override_to_workspace(
     - A single JSON object (backward-compatible), or
     - A JSON list of objects for multi-stanza append.
     """
-    del config
 
     def _flatten_intent(intent: dict[str, Any]) -> dict[str, Any]:
         """Flattens nested JSON payloads into a flat dictionary for TOML."""
@@ -532,8 +536,33 @@ def apply_override_to_workspace(
                 extracted = item
             target_intents.append(_flatten_intent(extracted))
 
-        base_toml = draft_toml if draft_toml else live_override_toml
-        doc = tomlkit.parse(base_toml)
+        try:
+            base_toml = draft_toml or live_override_toml
+            if not base_toml or not base_toml.strip():
+                return Command(update={"messages": [ToolMessage(
+                    content=json.dumps({
+                        "ok": False,
+                        "error_type": "MissingSnapshot",
+                        "details": "No live override loaded. Call refresh_live_override_snapshot first, then retry.",
+                    }),
+                    tool_call_id=runtime.tool_call_id or "",
+                )]})
+
+            raw_new_intents = _parse_payload(new_intents_json)
+            new_intents = [_flatten_intent(intent) for intent in raw_new_intents]
+            
+            doc = tomlkit.parse(base_toml)
+            
+        except Exception as exc:
+            tool_message = ToolMessage(
+                content=json.dumps({
+                    "ok": False,
+                    "error_type": "ApplyOverrideError",
+                    "details": f"{type(exc).__name__}: {exc or 'no detail'}",
+                }),
+                tool_call_id=runtime.tool_call_id or "",
+            )
+            return Command(update={"messages": [tool_message]})
         conflict_rules = _load_conflict_rules()
 
         doc = execute_ast_update(doc, target_intents, new_intents, conflict_rules)
@@ -544,7 +573,12 @@ def apply_override_to_workspace(
             tool_call_id=runtime.tool_call_id or "",
         )
         return Command(
-            update={"draft_toml": updated_toml, "messages": [tool_message]},
+            update={
+                "draft_toml": updated_toml,
+                # A new draft makes any earlier offline run stale.
+                "offline_diff_report_shown": False,
+                "messages": [tool_message],
+            },
         )
     except Exception as exc:
         tool_message = ToolMessage(
@@ -556,7 +590,6 @@ def apply_override_to_workspace(
             update={"messages": [tool_message]},
         )
 
-
 def _compact_deploy_result(response: dict[str, Any]) -> dict[str, Any]:
     """Reduce deploy payload to minimal fields for LLM context safety."""
     raw_success = response.get("success")
@@ -567,34 +600,45 @@ def _compact_deploy_result(response: dict[str, Any]) -> dict[str, Any]:
     else:
         success = bool(raw_success)
 
-    token: str | None = None
-    top_level_token = response.get("token") or response.get("override_token")
-    if top_level_token is not None:
-        token = str(top_level_token)
+    def _as_str(value: Any) -> str | None:
+        return None if value is None else str(value)
 
-    if token is None:
+    # `token` is the override revision token written by this deploy.
+    override_token = _as_str(response.get("offline_override_token"))
+
+    # `git_leroy_output_token` is the offline-vs-production diff token.
+    diff_token = _as_str(response.get("git_leroy_output_token"))
+
+    # Legacy fallback: older payloads nested the diff token inside `offline_diff`.
+    if diff_token is None:
         offline_diff = response.get("offline_diff")
         if isinstance(offline_diff, str):
             try:
                 parsed_diff = ast.literal_eval(offline_diff)
-                if isinstance(parsed_diff, dict):
-                    maybe_token = parsed_diff.get("token")
-                    if maybe_token is not None:
-                        token = str(maybe_token)
             except (ValueError, SyntaxError):
-                token = None
+                parsed_diff = None
+            if isinstance(parsed_diff, dict):
+                diff_token = _as_str(parsed_diff.get("token"))
         elif isinstance(offline_diff, dict):
-            maybe_token = offline_diff.get("token")
-            if maybe_token is not None:
-                token = str(maybe_token)
+            diff_token = _as_str(offline_diff.get("token"))
 
     compact_payload: dict[str, Any] = {
         "ok": success,
         "success": success,
         "returncode": response.get("returncode"),
     }
-    if token is not None:
-        compact_payload["offline_token"] = token
+    if override_token is not None:
+        compact_payload["offline_override_token"] = override_token
+    if diff_token is not None:
+        compact_payload["git_leroy_output_token"] = diff_token
+
+    diff_returncode = response.get("diff_returncode")
+    if diff_returncode is not None:
+        compact_payload["diff_returncode"] = diff_returncode
+        if diff_returncode != 0:
+            compact_payload["diff_stderr"] = truncate_with_marker(
+                response.get("diff_stderr", ""), "diff_stderr"
+            )
 
     if not success:
         compact_payload["message"] = truncate_with_marker(
@@ -614,6 +658,23 @@ def _compact_deploy_result(response: dict[str, Any]) -> dict[str, Any]:
 
     return compact_payload
 
+def _extract_inline_diff(response: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the {"token", "diffs"} payload embedded in an offline-run response."""
+    offline_diff = response.get("offline_diff")
+    if isinstance(offline_diff, str) and offline_diff.strip():
+        try:
+            offline_diff = ast.literal_eval(offline_diff.strip())
+        except (ValueError, SyntaxError):
+            offline_diff = json.loads(offline_diff)
+    if isinstance(offline_diff, dict) and offline_diff.get("diffs") is not None:
+        return offline_diff
+    if response.get("diffs") is not None:
+        return {
+            "token": response.get("git_leroy_output_token"),
+            "diffs": response.get("diffs"),
+        }
+    return None
+
 
 @tool
 def deploy_and_trigger_offline_computation(
@@ -621,18 +682,53 @@ def deploy_and_trigger_offline_computation(
     draft_toml: Annotated[str, InjectedState("draft_toml")],
     base_override_token: Annotated[str, InjectedState("base_override_token")],
 ) -> Command:
-    """Submit the drafted override TOML and trigger offline computation deployment."""
+    """
+    STEP 7 TOOL. Submit the drafted override TOML, trigger offline computation, and
+    return the offline-vs-production CSV diff.
+
+    On success the result contains a `report_markdown` field. It will display a 
+    human-readable summary of the offline-vs-production diff, including structural and quota changes.
+    On failure the result contains an `error_type` and `details` field describing the failure.
+    """
     try:
         response = submit_offline_override(
             updated_toml=draft_toml,
             base_token=base_override_token,
         )
         compact_response = _compact_deploy_result(response)
-        tool_message = ToolMessage(
-            content=json.dumps(compact_response),
-            tool_call_id=runtime.tool_call_id or "",
-        )
-        return Command(update={"messages": [tool_message]})
+
+        # Close the deploy gate; it reopens only once this run's diff is rendered.
+        state_update: dict[str, Any] = {"offline_diff_report_shown": False}
+        if compact_response.get("offline_override_token"):
+            state_update["override_token"] = compact_response["offline_override_token"]
+        if compact_response.get("git_leroy_output_token"):
+            state_update["git_leroy_output_token"] = compact_response[
+                "git_leroy_output_token"
+            ]
+
+        # Render the inline diff returned alongside the deploy result. The endpoint
+        # nests it as `offline_diff` (a Python-literal string or a dict); older
+        # payloads put `diffs` at the top level.
+        diff_payload = _extract_inline_diff(response)
+        if compact_response.get("ok") and diff_payload is not None:
+            try:
+                compact_response["report_markdown"] = _render_offline_prod_diff_report(
+                    diff_payload
+                )
+                # Mark the diff as presented so the deploy tool's gate opens.
+                state_update["offline_diff_report_shown"] = True
+            except Exception as exc:
+                compact_response["report_error"] = truncate_with_marker(
+                    str(exc), "report_error"
+                )
+
+        state_update["messages"] = [
+            ToolMessage(
+                content=json.dumps(compact_response),
+                tool_call_id=runtime.tool_call_id or "",
+            )
+        ]
+        return Command(update=state_update)
     except Exception as exc:
         tool_message = ToolMessage(
             content=json.dumps(
@@ -644,7 +740,189 @@ def deploy_and_trigger_offline_computation(
             ),
             tool_call_id=runtime.tool_call_id or "",
         )
-        return Command(update={"messages": [tool_message]})
+        # A failed run must not leave an earlier run's approval gate open.
+        return Command(
+            update={"offline_diff_report_shown": False, "messages": [tool_message]}
+        )
+
+
+def _format_timestamp(value: Any) -> str:
+    """Render an ISO timestamp (or missing value) for the report."""
+    if not value:
+        return "_not available_"
+    return str(value)
+
+
+def _format_structure_diffs(rows: list[dict[str, Any]]) -> list[str]:
+    """Render structure diffs grouped by change type as markdown bullets."""
+    if not rows:
+        return ["  - _No structural differences._"]
+
+    added = [row for row in rows if str(row.get("type", "")).lower() == "added"]
+    deleted = [row for row in rows if str(row.get("type", "")).lower() == "deleted"]
+    other = [row for row in rows if row not in added and row not in deleted]
+
+    lines: list[str] = []
+    for label, group in (("Added", added), ("Deleted", deleted), ("Other", other)):
+        if not group:
+            continue
+        lines.append(f"  - **{label} ({len(group)})**")
+        for row in group:
+            region = row.get("region", "?")
+            item = row.get("item", "?")
+            info = str(row.get("info", "")).strip()
+            suffix = f" — {info}" if info else ""
+            lines.append(f"    - region `{region}` | item `{item}`{suffix}")
+    return lines
+
+
+def _format_number(value: Any) -> str:
+    """Render numeric quota values without floating-point noise."""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{round(float(value), 2):g}"
+    return str(value)
+
+
+def _format_quota_diffs(rows: list[dict[str, Any]]) -> list[str]:
+    """Render quota diffs as a markdown table sorted by largest delta."""
+    if not rows:
+        return ["  - _No quota differences._"]
+
+    def _delta(row: dict[str, Any]) -> float:
+        try:
+            return abs(float(row.get("diff", 0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    ordered = sorted(rows, key=_delta, reverse=True)
+
+    lines = [
+        f"  - **{len(ordered)} quota change(s)**",
+        "",
+        "    | Region | Map | Offline | Production | Diff |",
+        "    | --- | --- | ---: | ---: | ---: |",
+    ]
+    for row in ordered:
+        region = row.get("region", "?")
+        identifier = row.get("map_identifier", row.get("item", "?"))
+        offline = _format_number(row.get("manual_quota", row.get("offline_quota", "?")))
+        production = _format_number(row.get("official_quota", row.get("production_quota", "?")))
+        diff = _format_number(row.get("diff", "?"))
+        lines.append(
+            f"    | {region} | {identifier} | {offline} | {production} | {diff} |"
+        )
+    lines.append("")
+    return lines
+
+
+def _render_offline_prod_diff_report(raw_payload: Any) -> str:
+    """Build a human-readable markdown report from the diff API payload."""
+
+    def _normalize_entries(payload: Any) -> tuple[list[dict[str, Any]], str | None]:
+        """
+        Returns:
+            (entries, token)
+        """
+        token: str | None = None
+
+        # 1) Wrapped HTTP payload form
+        # {"returncode":0, "stdout":"{'token':'...','diffs':{...}}", "stderr":""}
+        if isinstance(payload, dict) and "stdout" in payload:
+            if payload.get("returncode") not in (0, None):
+                raise ValueError(
+                    f"offline_prod_csv_diff failed (returncode={payload.get('returncode')}): "
+                    f"{payload.get('stderr') or payload.get('message') or 'unknown error'}"
+                )
+
+            stdout_val = payload.get("stdout", "")
+            if isinstance(stdout_val, str) and stdout_val.strip():
+                text = stdout_val.strip()
+                try:
+                    payload = ast.literal_eval(text)   # current endpoint style
+                except (ValueError, SyntaxError):
+                    payload = json.loads(text)         # fallback if backend switches to JSON
+            else:
+                payload = {}
+
+        # 2) Parsed stdout payload form
+        # {"token":"...", "diffs":{"blc.csv": {...}, "fcs.csv": {...}}}
+        if isinstance(payload, dict):
+            maybe_token = payload.get("token")
+            if maybe_token is not None:
+                token = str(maybe_token)
+
+            if "diffs" in payload and isinstance(payload["diffs"], dict):
+                payload = payload["diffs"]
+
+        # 3) Mapping filename -> entry
+        if isinstance(payload, dict):
+            # Single-entry dict form
+            if "filename" in payload:
+                return [payload], token
+
+            entries: list[dict[str, Any]] = []
+            for filename, entry in payload.items():
+                if isinstance(entry, dict):
+                    row = dict(entry)
+                    row.setdefault("filename", filename)
+                    entries.append(row)
+            return entries, token
+
+        # 4) List[dict] form
+        if isinstance(payload, list):
+            return [e for e in payload if isinstance(e, dict)], token
+
+        return [], token
+
+    entries, token = _normalize_entries(raw_payload)
+
+    if not entries:
+        return "### 📊 Offline vs Production CSV Diff\n\n_No files returned by the diff API._"
+
+    total_structure = 0
+    total_quota = 0
+    blocks: list[str] = ["### 📊 Offline vs Production CSV Diff", ""]
+
+    for entry in entries:
+        filename = entry.get("filename", "<unknown file>")
+
+        structure_diffs = entry.get("structure_diffs")
+        quota_diffs = entry.get("quota_diffs")
+        if not isinstance(structure_diffs, list):
+            structure_diffs = []
+        if not isinstance(quota_diffs, list):
+            quota_diffs = []
+
+        total_structure += len(structure_diffs)
+        total_quota += len(quota_diffs)
+
+        blocks.append(f"#### 📄 `{filename}`")
+        blocks.append(
+            "- **Offline last modified:** "
+            + _format_timestamp(entry.get("offline_last_modified"))
+        )
+        blocks.append(
+            "- **Production last modified:** "
+            + _format_timestamp(entry.get("production_last_modified"))
+        )
+        blocks.append(f"- **Structure diffs ({len(structure_diffs)}):**")
+        blocks.extend(_format_structure_diffs(structure_diffs))
+        blocks.append(f"- **Quota diffs ({len(quota_diffs)}):**")
+        blocks.extend(_format_quota_diffs(quota_diffs))
+        blocks.append("")
+
+    blocks.append(
+        f"**Summary:** {len(entries)} file(s), "
+        f"{total_structure} structural change(s), {total_quota} quota change(s)."
+    )
+
+    if token:
+        blocks.append("")
+        blocks.append(f"**Diff token:** `{token}`")
+
+    return "\n".join(blocks)
 
 
 @tool
@@ -676,6 +954,159 @@ def request_deployment_approval(stanzas_to_add: str, stanzas_to_delete: str, mes
     user_response = interrupt(markdown_string)
     return user_response
 
+
+@tool
+def deploy_offline_override_record(
+    runtime: ToolRuntime,
+    draft_toml: Annotated[str, InjectedState("draft_toml")],
+    git_leroy_output_token: Annotated[str, InjectedState("git_leroy_output_token")],
+    override_token: Annotated[str, InjectedState("override_token")],
+    base_override_token: Annotated[str, InjectedState("base_override_token")],
+    offline_diff_report_shown: Annotated[
+        bool, InjectedState("offline_diff_report_shown")
+    ],
+) -> Command:
+    """
+    STEP 8 TOOL. Promotes the offline override record to production.
+
+    Use this ONLY when the user has already been shown the offline-vs-production
+    diff report AND then explicitly asks to deploy (e.g. "approve", "deploy the
+    offline override record"). This tool will pause and ask the user to confirm
+    one final time before anything is promoted. Never call it before the diff
+    report has been presented.
+    """
+    # Guard 1: the diff must actually have been rendered for the user.
+    if not offline_diff_report_shown:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error_type": "DiffNotReviewed",
+                                "details": (
+                                    "The offline-vs-production diff has not been shown "
+                                    "to the user yet. Run "
+                                    "deploy_and_trigger_offline_computation, present the "
+                                    "report, and only then retry the deploy."
+                                ),
+                            }
+                        ),
+                        tool_call_id=runtime.tool_call_id or "",
+                    )
+                ]
+            }
+        )
+
+    # Guard 2: we need the token identifying the offline run to promote.
+    if not git_leroy_output_token:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error_type": "MissingOfflineToken",
+                                "details": (
+                                    "No git_leroy_output_token in state. The offline "
+                                    "computation must complete successfully before deploying."
+                                ),
+                            }
+                        ),
+                        tool_call_id=runtime.tool_call_id or "",
+                    )
+                ]
+            }
+        )
+
+    # Guard 3: explicit human confirmation at the point of no return.
+    confirmation = interrupt(
+        "### 🚀 Final Confirmation: Deploy to Production\n\n"
+        "You are about to promote the reviewed offline override record to production.\n\n"
+        f"- **Offline run token:** `{git_leroy_output_token}`\n"
+        f"- **Override revision:** `{override_token or 'unknown'}`\n"
+        f"- **Base production revision:** `{base_override_token or 'unknown'}`\n\n"
+        "**This action affects live traffic.** Reply `deploy` or `approve` to proceed, "
+        "or anything else to cancel."
+    )
+
+    approved = str(confirmation or "").strip().lower() in {
+        "deploy",
+        "approve",
+        "approved",
+        "yes",
+        "y",
+        "confirm",
+        "confirmed",
+    }
+    if not approved:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error_type": "DeploymentCancelled",
+                                "details": (
+                                    "User did not confirm the production deploy. "
+                                    f"Response was: {confirmation!r}"
+                                ),
+                            }
+                        ),
+                        tool_call_id=runtime.tool_call_id or "",
+                    )
+                ]
+            }
+        )
+
+    try:
+        response = deploy_override(
+            updated_toml=draft_toml,
+            git_leroy_output_token=git_leroy_output_token,
+            override_token=override_token or None,
+            base_token=base_override_token or None,
+        )
+        compact_response = {
+            "ok": True,
+            "message": "Offline override record deployed to production.",
+            "returncode": response.get("returncode"),
+        }
+        deploy_message = response.get("message")
+        if deploy_message:
+            compact_response["deploy_message"] = truncate_with_marker(
+                str(deploy_message), "deploy_message"
+            )
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(compact_response),
+                        tool_call_id=runtime.tool_call_id or "",
+                    )
+                ]
+            }
+        )
+    except Exception as exc:
+        return Command(
+            update={
+                "messages": [
+                    ToolMessage(
+                        content=json.dumps(
+                            {
+                                "ok": False,
+                                "error_type": "DeployOverrideError",
+                                "details": truncate_with_marker(str(exc), "details"),
+                            }
+                        ),
+                        tool_call_id=runtime.tool_call_id or "",
+                    )
+                ]
+            }
+        )
+
 SUPERVISOR_TOOLS = [
     extract_override_intent,
     refresh_live_override_snapshot,
@@ -688,4 +1119,5 @@ SUPERVISOR_TOOLS = [
     request_deployment_approval,
     apply_override_to_workspace,
     deploy_and_trigger_offline_computation,
+    deploy_offline_override_record,
 ]
